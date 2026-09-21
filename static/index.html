@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>相位支切室</title>
+<style>
+  body { font-family: "PingFang SC", "Microsoft YaHei", sans-serif;
+         background:#14171c; color:#dfe5ee; margin:0; padding:16px; }
+  h1 { font-size:20px; margin:0 0 12px; }
+  h2 { font-size:14px; margin:14px 0 6px; color:#9fb4d0; }
+  .wrap { display:flex; gap:20px; align-items:flex-start; flex-wrap:wrap; }
+  .views { display:grid; grid-template-columns:repeat(2, auto); gap:12px; }
+  .view { background:#1c2129; border:1px solid #2c3442; border-radius:8px;
+          padding:8px; }
+  .view .cap { font-size:12px; color:#8fa0b8; margin-bottom:4px; }
+  canvas { image-rendering:pixelated; display:block; }
+  .panel { flex:1; min-width:320px; max-width:460px; background:#1c2129;
+           border:1px solid #2c3442; border-radius:8px; padding:12px; }
+  button { background:#2f6fed; color:#fff; border:0; border-radius:5px;
+           padding:4px 10px; font-size:12px; cursor:pointer; margin:2px; }
+  button.sub { background:#3a4356; }
+  button.warn { background:#a03c3c; }
+  .cand, .edge, .run, .comp { font-size:12px; padding:4px 6px; margin:3px 0;
+           background:#232a36; border-radius:5px; }
+  .comp.unreach { border-left:3px solid #d98a2b; }
+  .comp.reach { border-left:3px solid #4caf50; }
+  .msg { font-size:12px; color:#8fd18f; min-height:16px; }
+  .err { color:#ef8a8a; }
+  label { font-size:12px; }
+  .row { margin:6px 0; }
+  code { color:#9fd0ff; }
+</style>
+</head>
+<body>
+<h1>相位支切室</h1>
+<div class="wrap">
+  <div class="views">
+    <div class="view"><div class="cap">包裹相位 (-π, π]</div>
+      <canvas id="cvWrapped"></canvas></div>
+    <div class="view"><div class="cap">振幅质量（黑=遮挡）</div>
+      <canvas id="cvQuality"></canvas></div>
+    <div class="view"><div class="cap">残差电荷与支切（点击设定起始像素）</div>
+      <canvas id="cvCuts"></canvas></div>
+    <div class="view"><div class="cap">展开相位（各连通域独立偏置）</div>
+      <canvas id="cvUnwrapped"></canvas></div>
+  </div>
+  <div class="panel">
+    <h2>自动配对候选</h2>
+    <div class="row">
+      <button onclick="genCandidates()">自动配对</button>
+      <span id="candMsg" class="msg"></span>
+    </div>
+    <div id="candidates"></div>
+    <h2>当前支切</h2>
+    <div id="edges"></div>
+    <div class="row" id="unbalanced"></div>
+    <h2>展开</h2>
+    <div class="row">起始像素: <code id="startPix">未设定（点击左下图）</code>
+      <button onclick="runUnwrap()">运行展开</button></div>
+    <div id="components"></div>
+    <h2>运行记录</h2>
+    <div class="row">
+      <button class="sub" onclick="exportRuns()">导出记录</button>
+      <button class="sub" onclick="document.getElementById('impFile').click()">导入记录</button>
+      <input type="file" id="impFile" style="display:none" onchange="importRuns(this)">
+      <button class="warn" onclick="clearDb()">清空数据库</button>
+    </div>
+    <div id="runs"></div>
+    <div id="runMsg" class="msg"></div>
+  </div>
+</div>
+<script>
+let DS = null, CELL = 22;
+let locks = [], forbids = [], candidates = [];
+let currentEdges = [], currentVersionId = null, currentSegments = [];
+let startPixel = null, lastResult = null;
+
+const $ = id => document.getElementById(id);
+async function api(path, method, body) {
+  const opt = {method: method || 'GET', headers: {'Content-Type': 'application/json'}};
+  if (body !== undefined) opt.body = JSON.stringify(body);
+  const r = await fetch(path, opt);
+  const j = await r.json();
+  if (!r.ok) throw new Error(j.detail || r.statusText);
+  return j;
+}
+function msg(id, text, isErr) {
+  const el = $(id); el.textContent = text;
+  el.className = isErr ? 'msg err' : 'msg';
+}
+
+function hue(t) { return `hsl(${(1 - t) * 240}, 85%, 55%)`; }
+
+function drawField(cv, val, colorFn) {
+  const [H, W] = DS.shape;
+  cv.width = W * CELL; cv.height = H * CELL;
+  const ctx = cv.getContext('2d');
+  for (let r = 0; r < H; r++) for (let c = 0; c < W; c++) {
+    ctx.fillStyle = DS.valid[r][c] ? colorFn(val[r][c]) : '#101014';
+    ctx.fillRect(c * CELL, r * CELL, CELL, CELL);
+  }
+  return ctx;
+}
+
+function drawWrapped() {
+  drawField($('cvWrapped'), DS.wrapped,
+            v => hue((v + Math.PI) / (2 * Math.PI)));
+}
+function drawQuality() {
+  drawField($('cvQuality'), DS.quality,
+            v => `rgb(${v*255|0},${v*255|0},${v*255|0})`);
+}
+function drawCuts() {
+  const ctx = drawField($('cvCuts'), DS.wrapped, v => {
+    const t = (v + Math.PI) / (2 * Math.PI);
+    return `hsl(${(1 - t) * 240}, 40%, 30%)`;
+  });
+  ctx.strokeStyle = '#39e639'; ctx.lineWidth = 2;
+  for (const seg of currentSegments) {
+    ctx.beginPath();
+    ctx.moveTo((seg[0][1] + .5) * CELL, (seg[0][0] + .5) * CELL);
+    ctx.lineTo((seg[1][1] + .5) * CELL, (seg[1][0] + .5) * CELL);
+    ctx.stroke();
+  }
+  ctx.font = 'bold 13px sans-serif'; ctx.textAlign = 'center';
+  for (const r of DS.residues) {
+    const x = (r.c + 1) * CELL, y = (r.r + 1) * CELL;
+    ctx.fillStyle = r.charge > 0 ? '#ff5252' : '#40a0ff';
+    ctx.beginPath(); ctx.arc(x, y, 8, 0, 7); ctx.fill();
+    ctx.fillStyle = '#fff';
+    ctx.fillText(r.charge > 0 ? '+' : '−', x, y + 4);
+  }
+  if (startPixel) {
+    ctx.strokeStyle = '#ffd54f'; ctx.lineWidth = 2;
+    ctx.strokeRect(startPixel[1] * CELL + 1, startPixel[0] * CELL + 1,
+                   CELL - 2, CELL - 2);
+  }
+}
+function drawUnwrapped() {
+  const cv = $('cvUnwrapped');
+  if (!lastResult) {
+    drawField(cv, DS.valid.map(row => row.map(() => 0)), () => '#20242c');
+    return;
+  }
+  let lo = 1e9, hi = -1e9;
+  for (const row of lastResult.unwrapped) for (const v of row)
+    if (v !== null) { lo = Math.min(lo, v); hi = Math.max(hi, v); }
+  const span = Math.max(hi - lo, 1e-9);
+  drawField(cv, lastResult.unwrapped,
+            v => v === null ? '#101014' : hue((v - lo) / span));
+}
+
+async function genCandidates() {
+  try {
+    const j = await api('/api/candidates', 'POST', {locks, forbids});
+    candidates = j.candidates;
+    $('candidates').innerHTML = candidates.map((c, i) => `
+      <div class="cand">
+        <label><input type="radio" name="cand" value="${i}" ${i===0?'checked':''}>
+        <b>${c.name}</b> 总成本 ${c.total_cost}</label>
+        ${c.edges.map(e => `<div>· ${e.a} → ${e.b === 'boundary' ? '外边界' : e.b} (成本 ${e.cost})</div>`).join('')}
+      </div>`).join('') + `<button onclick="applyCandidate()">应用候选为新支切版本</button>`;
+    msg('candMsg', `已生成 ${candidates.length} 个候选`);
+  } catch (e) { msg('candMsg', e.message, true); }
+}
+
+async function applyCandidate() {
+  const sel = document.querySelector('input[name=cand]:checked');
+  if (!sel) return;
+  const c = candidates[+sel.value];
+  await saveCut(c.edges.map(e => ({a: e.a, b: e.b})), `auto-${c.name}`);
+}
+
+async function saveCut(edges, name) {
+  try {
+    const j = await api('/api/cuts', 'POST', {name, edges});
+    currentVersionId = j.id; currentSegments = j.segments; currentEdges = edges;
+    renderEdges(); drawCuts();
+    msg('candMsg', `支切版本 #${j.id} 已保存`);
+  } catch (e) { msg('candMsg', e.message, true); }
+}
+
+function renderEdges() {
+  $('edges').innerHTML =
+    `<div class="edge">版本: ${currentVersionId === null ? '未保存' : '#' + currentVersionId}</div>` +
+    currentEdges.map((e, i) => `
+      <div class="edge">${e.a} → ${e.b === 'boundary' ? '外边界' : e.b}
+        <button class="sub" onclick="lockEdge(${i})">锁定</button>
+        <button class="warn" onclick="forbidEdge(${i})">禁止</button>
+      </div>`).join('');
+  const paired = new Set();
+  for (const e of currentEdges) { paired.add(e.a); paired.add(e.b); }
+  const unb = DS.residues.filter(r => !paired.has(r.id));
+  $('unbalanced').innerHTML = unb.length
+    ? '未平衡残差: ' + unb.map(r =>
+        `<button class="sub" onclick="toBoundary('${r.id}')">${r.id}(${r.charge>0?'+':'−'}) 连到外边界</button>`).join('')
+    : '无未平衡残差';
+}
+
+function lockEdge(i) {
+  const e = currentEdges[i];
+  locks.push([e.a, e.b].sort());
+  msg('candMsg', `已锁定 ${e.a}→${e.b}，重新“自动配对”生效`);
+}
+async function forbidEdge(i) {
+  const e = currentEdges[i];
+  forbids.push([e.a, e.b].sort());
+  currentEdges.splice(i, 1);
+  await saveCut(currentEdges, 'edit-forbid');
+}
+async function toBoundary(rid) {
+  await saveCut(currentEdges.concat([{a: rid, b: 'boundary'}]), 'edit-boundary');
+}
+
+async function runUnwrap() {
+  if (currentVersionId === null) { msg('runMsg', '请先生成并应用支切版本', true); return; }
+  if (!startPixel) { msg('runMsg', '请先点击设定起始像素', true); return; }
+  try {
+    const j = await api('/api/unwrap', 'POST',
+                        {cut_version_id: currentVersionId, start: startPixel});
+    lastResult = j;
+    drawUnwrapped(); renderComponents(j); listRuns();
+    msg('runMsg', `运行 #${j.run_id} 摘要 ${j.digest.slice(0, 12)}…`);
+  } catch (e) { msg('runMsg', e.message, true); }
+}
+
+function renderComponents(j) {
+  $('components').innerHTML = j.components.map(c => `
+    <div class="comp ${c.reachable_from_start ? 'reach' : 'unreach'}">
+      连通域 #${c.id}: 种子 (${c.seed[0]},${c.seed[1]}), ${c.size} 像素,
+      ${c.reachable_from_start ? '自起始点可达' : '未可达（独立整数偏置）'}
+    </div>`).join('');
+}
+
+async function listRuns() {
+  const j = await api('/api/runs');
+  $('runs').innerHTML = j.runs.map(r => `
+    <div class="run">#${r.id} 支切v${r.cut_version_id} 起点(${r.start})
+      ${r.digest.slice(0, 10)}…
+      <button class="sub" onclick="replay(${r.id})">重放</button></div>`).join('');
+}
+async function replay(rid) {
+  try {
+    const j = await api(`/api/runs/${rid}/replay`, 'POST');
+    lastResult = j; drawUnwrapped(); renderComponents(j);
+    msg('runMsg', j.match ? `重放一致 ✓ (${j.digest.slice(0, 12)}…)`
+                          : '重放摘要不一致 ✗', !j.match);
+  } catch (e) { msg('runMsg', e.message, true); }
+}
+async function exportRuns() {
+  const j = await api('/api/runs/export');
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([JSON.stringify(j, null, 2)]));
+  a.download = 'phasecut-runs.json'; a.click();
+}
+async function importRuns(input) {
+  if (!input.files.length) return;
+  const payload = JSON.parse(await input.files[0].text());
+  try {
+    const j = await api('/api/runs/import', 'POST', payload);
+    msg('runMsg', `导入支切 ${j.cut_versions} 条 / 运行 ${j.runs} 条`);
+    listRuns();
+  } catch (e) { msg('runMsg', e.message, true); }
+}
+async function clearDb() {
+  await api('/api/admin/clear', 'POST');
+  currentVersionId = null; currentEdges = []; currentSegments = [];
+  lastResult = null; renderEdges(); drawCuts(); drawUnwrapped(); listRuns();
+  msg('runMsg', '数据库已清空');
+}
+
+$('cvCuts').addEventListener('click', ev => {
+  const rect = ev.target.getBoundingClientRect();
+  const c = Math.floor((ev.clientX - rect.left) / CELL);
+  const r = Math.floor((ev.clientY - rect.top) / CELL);
+  if (!DS.valid[r][c]) { msg('runMsg', '遮挡像素不能作为起点', true); return; }
+  startPixel = [r, c];
+  $('startPix').textContent = `(${r}, ${c})`;
+  drawCuts();
+});
+
+(async function init() {
+  DS = await api('/api/dataset');
+  drawWrapped(); drawQuality(); drawCuts(); drawUnwrapped();
+  renderEdges(); listRuns(); genCandidates();
+})();
+</script>
+</body>
+</html>
